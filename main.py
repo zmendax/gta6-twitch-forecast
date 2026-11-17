@@ -54,13 +54,26 @@ MAX_VIEWERS = 1_000_000_000
 
 
 def hour_of(iso: str, day_start: str) -> int:
-    """The whole hour between `iso` and the case's day_start."""
-    fmt = "%Y-%m-%dT%H:%M:%SZ"
-    import datetime as _dt
+    """The whole hour between `iso` and the case's day_start.
 
-    a = _dt.datetime.strptime(iso, fmt).replace(tzinfo=_dt.timezone.utc)
-    b = _dt.datetime.strptime(day_start, fmt).replace(tzinfo=_dt.timezone.utc)
-    return round((a - b).total_seconds() / 3600.0)
+    Both are `YYYY-MM-DDTHH:MM:SS[.fff]Z`, so the arithmetic is done on the digits alone: the
+    cases carry a few hundred points per comparable and strptime is far too slow for them.
+    """
+
+    def seconds(stamp: str) -> int:
+        date, _, clock = stamp.partition("T")
+        year, month, day = (int(part) for part in date.split("-"))
+        hour, minute, rest = clock.split(":")
+        # Days from the civil calendar, Howard Hinnant's algorithm: exact for every date, and fast.
+        year_shifted = year - (1 if month <= 2 else 0)
+        era = year_shifted // 400
+        year_of_era = year_shifted - era * 400
+        day_of_year = (153 * (month + (-3 if month > 2 else 9)) + 2) // 5 + day - 1
+        day_of_era = year_of_era * 365 + year_of_era // 4 - year_of_era // 100 + day_of_year
+        days = era * 146097 + day_of_era
+        return days * 86400 + int(hour) * 3600 + int(minute) * 60 + int(rest[:2])
+
+    return round((seconds(iso) - seconds(day_start)) / 3600.0)
 
 
 def median(values):
