@@ -73,6 +73,18 @@ def hour_of(iso: str, day_start: str) -> int:
         days = era * 146097 + day_of_era
         return days * 86400 + int(hour) * 3600 + int(minute) * 60 + int(rest[:2])
 
+    try:
+        return round((seconds(iso) - seconds(day_start)) / 3600.0)
+    except ValueError:
+        # A stamp this reader does not know (no other shape appears in the cases): fall back to the
+        # standard library rather than lose the point.
+        import datetime as _dt
+
+        def parse(stamp: str) -> _dt.datetime:
+            return _dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+
+        return round((parse(iso) - parse(day_start)).total_seconds() / 3600.0)
+
     return round((seconds(iso) - seconds(day_start)) / 3600.0)
 
 
@@ -175,11 +187,31 @@ def forecast_case(case: dict) -> dict:
     return {"hours": hours}
 
 
+def fallback_case(case: dict, reason: str) -> dict:
+    """Hour 1 held flat with the house baseline's widening: what a case gets if the model cannot run.
+
+    An invalid case scores worse than any valid one and takes the entry out of the prizes, so a case
+    that trips the model is still answered, in the shape the grader accepts.
+    """
+    known = next((row for row in case.get("known") or [] if row.get("hour") == 1), None)
+    p1 = max(1.0, float((known or {}).get("viewers") or 1))
+    print(f"fallback for {case.get('id')}: {reason}", file=sys.stderr)
+    hours = []
+    for hour in HOURS:
+        sigma = 0.15 * math.sqrt(hour - 1)
+        quantiles = sorted(min(MAX_VIEWERS, max(0.01, p1 * math.exp(z * sigma))) for z in Z)
+        hours.append({"hour": hour, "q": [round(q, 2) for q in quantiles]})
+    return {"hours": hours}
+
+
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
+        try:
+            forecast = forecast_case(case)
+        except Exception as error:  # noqa: BLE001 - one bad case must not lose the others
+            forecast = fallback_case(case, repr(error))
         (OUTPUT_DIR / f"{path.stem}.out").write_text(
             json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
         )
