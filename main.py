@@ -1,33 +1,29 @@
-"""gta6-twitch-ccu-forecast-01's starter in Python 3.13 (standard library only): persistence.
+"""Forecast Grand Theft Auto VI's launch-day Twitch viewers, hour by hour.
 
-The same program as starter/main.ts (the house baseline), number for number and byte for byte: it forecasts that every
-hour of release day draws as many concurrent Twitch viewers in the Grand Theft Auto VI category as hour 1 did, with a
-spread that widens like a random walk's in log space:
+Given one case (`/input/<id>.in`): the same category's viewers up to the end of release day's
+first hour, plus 38-42 comparable games' hourly curves from 14 days before their release day to
+3 days after, the program writes one forecast per case: for hours 2..24 of the release day, the
+5%, 25%, 50%, 75% and 95% quantiles of that hour's viewers.
 
-    q_tau(h) = p1 * exp(z_tau * 0.15 * sqrt(h - 1)), rounded to 2 decimals (half up)
+How the forecast is made
+------------------------
+Every comparable is summarised by two numbers that the case does hold before the hour runs:
 
-for the hours h = 2..24 of the UTC day, where p1 is hour 1's print (the case's `known` row for hour 1; a print below 1
-counts as 1) and z_tau is the standard normal's quantile at each level (0.05, 0.25, 0.5, 0.75, 0.95):
--1.645, -0.674, 0, 0.674, 1.645.
+  scale  = ln(hour 1's viewers)                how big the launch's live audience is
+  jump   = ln(hour 1's viewers / pre-launch)   how much of the ramp already happened by hour 1
 
-How the grader runs it: `python3 -P -s /bot/main.py` (PYTHONHASHSEED=0) in python:3.13-slim, standard library only: no
-network, no pip packages. -P keeps this file's directory OFF sys.path, so a module you ship beside main.py (say
-/bot/model.py) imports only after the sys.path line below, which puts the directory first; -s drops user
-site-packages.
+The curve each comparable drew after its own hour 1 is its ratio to its own hour 1, hour by hour.
+A launch's later hours are then the weighted median of those ratios: comparables whose scale is
+close to this launch's count most, since a mega-launch and a small one follow different curves,
+and a weak term keeps launches whose ramp had reached a similar stage close too. The spread comes
+from the same weighted sample: its interquantile range sets a Gaussian width on the log scale, so
+the bands widen where launches disagree and narrow where they agree, and a floor keeps an hour
+whose comparables happen to agree from claiming certainty it does not have.
 
-What an entry must do:
-  - read every <id>.in in the input directory (the grader runs one case at a time, with only that case's file there):
-    JSON {"schema": "makefun/twitch-ccu-case/v1", "id", "game", "day_start", "checkpoint", "levels", "known",
-    "forecast", "history", "history_hourly", "streams", "categories_hourly", "comparables", "notes"}, where `known`
-    holds hour 1's print {hour: 1, from, until, viewers, channels, reads} and `forecast` lists the hours to forecast,
-    2..24;
-  - write <id>.out to the output directory: {"hours": [{"hour": 2, "q": [q05, q25, q50, q75, q95]}, ...]}, exactly 23
-    rows, hours 2..24 each once, no other key, each q five finite numbers above 0 and at most 1e9 (viewers; fractions
-    allowed), non-decreasing; at most 65,536 bytes. Anything else is an invalid case, scored as if every quantile
-    equalled hour 1's print, and an entry with an invalid case takes no prize.
+Everything is deterministic: no clock, no randomness, no network, and the comparables are read in
+the order the case lists them, so two runs on one case write the same bytes.
 
-Outside the grader's container, MAKEFUN_INPUT_DIR and MAKEFUN_OUTPUT_DIR stand in for /input and /output:
-    mkdir -p out && MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
+Run it on your machine:  MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 """
 
 import json
@@ -36,56 +32,145 @@ import os
 import sys
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so `import model` finds a model.py shipped beside this file.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
 OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 
-# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-# The spread of an hour's move, in natural-log units per square-root hour.
-SIGMA = 0.15
+# The standard normal's quantile at each level; the spread is modelled as Gaussian in log viewers.
+Z = [-1.6449, -0.6745, 0.0, 0.6745, 1.6449]
+HOURS = list(range(2, 25))
+
+# Similarity kernel, in natural-log units. A launch twice as big as another is 0.69 apart.
+SIGMA_SCALE = 0.6
+SIGMA_JUMP = 3.0
+# Launches of this audience size run a little above the pooled median ratio; a small shift down.
+BIAS = -0.05
+# Multiplier on the sampled interquantile spread, and its floor in log units.
+INFLATE = 1.0
+SIGMA_FLOOR = 0.2
+# Fewer usable comparables than this and the hour falls back to the pooled ratio alone.
+MIN_ROWS = 4
+MAX_VIEWERS = 1_000_000_000
 
 
-def round2(x: float) -> float | int:
-    """x rounded to 2 decimals, half up, as JavaScript's Math.round(x * 100) / 100 rounds it.
+def hour_of(iso: str, day_start: str) -> int:
+    """The whole hour between `iso` and the case's day_start."""
+    fmt = "%Y-%m-%dT%H:%M:%SZ"
+    import datetime as _dt
 
-    A whole number comes back as an int, so json.dumps writes 1240 where JavaScript writes 1240 (not 1240.0).
-    """
-    scaled = x * 100
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100
-    return int(value) if value.is_integer() else value
+    a = _dt.datetime.strptime(iso, fmt).replace(tzinfo=_dt.timezone.utc)
+    b = _dt.datetime.strptime(day_start, fmt).replace(tzinfo=_dt.timezone.utc)
+    return round((a - b).total_seconds() / 3600.0)
 
 
-def hour_quantiles(p1: float, h: int) -> list[float | int]:
-    """The persistence forecast of hour h: the five quantiles around hour 1's print."""
-    return [round2(p1 * math.exp(z * SIGMA * math.sqrt(h - 1))) for z in Z]
+def median(values):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[len(ordered) // 2]
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1, first["viewers"])
-    return {"hours": [{"hour": row["hour"], "q": hour_quantiles(p1, row["hour"])} for row in case["forecast"]]}
+def summarise(comparable: dict) -> dict | None:
+    """One comparable's hourly curve and the two numbers the kernel uses."""
+    day_start = comparable.get("day_start")
+    hourly = comparable.get("hourly") or []
+    if not day_start or not hourly:
+        return None
+    by_hour: dict[int, float] = {}
+    for point in hourly:
+        viewers = point.get("viewers")
+        if viewers is None:
+            continue
+        try:
+            by_hour[hour_of(point["from"], day_start)] = float(viewers)
+        except (KeyError, ValueError):
+            continue
+    first = by_hour.get(1)
+    if not first or first <= 0:
+        return None
+    before = [by_hour[h] for h in range(-6, 1) if h in by_hour and by_hour[h] > 0]
+    pre = median(before) or first
+    return {
+        "name": comparable.get("name") or "",
+        "at": by_hour,
+        "p1": first,
+        "scale": math.log(first),
+        "jump": math.log(first / max(1.0, pre)),
+    }
+
+
+def weighted_quantile(rows: list[tuple[float, float]], p: float) -> float:
+    """The p-quantile of `rows` as (value, weight) pairs, weights read as a step CDF."""
+    ordered = sorted(rows)
+    total = math.fsum(w for _, w in ordered)
+    if total <= 0:
+        return ordered[len(ordered) // 2][0]
+    target = p * total
+    acc = 0.0
+    for value, weight in ordered:
+        acc += weight
+        if acc >= target:
+            return value
+    return ordered[-1][0]
+
+
+def forecast_case(case: dict) -> dict:
+    known = next((row for row in case.get("known") or [] if row.get("hour") == 1), None)
+    if known is None:
+        raise ValueError("the case has no hour-1 print")
+    p1 = max(1.0, float(known.get("viewers") or 1))
+    target_scale = math.log(p1)
+
+    # The launch's own pre-release baseline, so its ramp stage can be read the same way.
+    own_history = [row["viewers"] for row in case.get("history_hourly") or [] if row.get("viewers")]
+    own_pre = median(own_history[-6:]) if own_history else None
+    target_jump = math.log(p1 / max(1.0, own_pre)) if own_pre else 0.0
+
+    comparables = []
+    for raw in case.get("comparables") or []:
+        made = summarise(raw)
+        if made is not None:
+            comparables.append(made)
+
+    hours = []
+    for hour in HOURS:
+        rows = []
+        for comp in comparables:
+            viewers = comp["at"].get(hour)
+            if viewers is None or viewers <= 0:
+                continue
+            distance = ((comp["scale"] - target_scale) / SIGMA_SCALE) ** 2 + (
+                (comp["jump"] - target_jump) / SIGMA_JUMP
+            ) ** 2
+            rows.append((math.log(viewers) - math.log(comp["p1"]), math.exp(-distance / 2.0)))
+
+        if len(rows) < MIN_ROWS:
+            # No usable comparables: hold hour 1 with the same widening the house baseline uses.
+            centre, sigma = 0.0, 0.15 * math.sqrt(hour - 1)
+        else:
+            centre = weighted_quantile(rows, 0.5) + BIAS
+            spread = (weighted_quantile(rows, 0.75) - weighted_quantile(rows, 0.25)) / 1.349
+            sigma = max(SIGMA_FLOOR, spread) * INFLATE
+
+        quantiles = []
+        for z in Z:
+            q = p1 * math.exp(centre + z * sigma)
+            quantiles.append(min(MAX_VIEWERS, max(0.01, q)))
+        quantiles.sort()
+        hours.append({"hour": hour, "q": [round(q, 2) for q in quantiles]})
+
+    return {"hours": hours}
 
 
 def main() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
     for path in sorted(INPUT_DIR.glob("*.in")):
         case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        forecast = forecast_case(case)
+        (OUTPUT_DIR / f"{path.stem}.out").write_text(
+            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
